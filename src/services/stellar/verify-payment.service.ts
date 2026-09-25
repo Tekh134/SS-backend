@@ -102,6 +102,7 @@ export class VerifyPaymentService {
     this.fetchImplementation = dependencies.fetchImplementation ?? fetch;
     this.sleep =
       dependencies.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.logger = dependencies.logger ?? VerifyPaymentService.NOOP_LOGGER;
   }
 
   async verifyPayment(input: PaymentVerificationInput): Promise<PaymentVerificationResult> {

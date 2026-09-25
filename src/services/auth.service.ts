@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import jwt, { JwtPayload, type SignOptions } from "jsonwebtoken";
-import { DataSource, IsNull, Repository } from "typeorm";
+import { DataSource, FindOptionsSelect, IsNull, Repository } from "typeorm";
 import { Keypair, StrKey } from "stellar-sdk";
 import type { AppConfig } from "../config/env";
 import { AuthChallenge } from "../models/AuthChallenge.model";
@@ -8,12 +8,6 @@ import { User, USER_PROFILE_SELECT } from "../models/User.model";
 import type { PublicUser } from "../types/auth";
 import { HttpError } from "../utils/http-error";
 import { buildAuthFailureDetails, classifyJwtError } from "../lib/auth-failure";
-import { AppError, HttpError } from "../utils/http-error";
-import { logger } from "../observability/logger";
-import {
-  buildAuthFailureDetails,
-  classifyJwtError,
-} from "../lib/auth-failure";
 import type { AppLogger } from "../observability/logger";
 import { buildWalletChallenge } from "../utils/stellar-challenge";
 import { MetricsRegistry } from "../observability/metrics";
@@ -73,11 +67,6 @@ export interface AuthServiceDependencies {
   challengeRepository: ChallengeRepositoryContract;
   config: Pick<AppConfig, "jwt" | "auth" | "stellar"> & { serverKeypair?: Keypair };
   logger?: AppLogger;
-  /**
-   * Override the clock used for challenge TTL checks. Mostly useful in tests;
-   * leave unset in production.
-   */
-  now?: () => number;
   metrics?: MetricsRegistry;
 }
 
@@ -104,27 +93,12 @@ export interface VerifyChallengeResponse {
   user: PublicUser;
 }
 
-/** Minimum nonce length (chars) accepted by verifyChallenge. */
-const MIN_NONCE_LENGTH = 16;
-
 export class AuthService {
   private readonly userRepository: UserRepositoryContract;
   private readonly challengeRepository: ChallengeRepositoryContract;
   private readonly config: Pick<AppConfig, "jwt" | "auth" | "stellar">;
   private readonly logger?: AppLogger;
   private readonly serverKeypair?: Keypair;
-  private readonly now: () => number;
-
-  /**
-   * In-process single-flight cache for user upserts keyed by Stellar address.
-   * Collapses concurrent `verifyChallenge` flows for the same wallet into a
-   * single repository write — preventing the unique-index race where two
-   * parallel "first login" attempts both try to `INSERT` the same row.
-   *
-   * Errors are intentionally NOT cached: a transient DB failure on one
-   * request must not poison subsequent ones.
-   */
-  private readonly userUpsertInflight = new Map<string, Promise<User>>();
   private readonly metrics?: MetricsRegistry;
 
   constructor(dependencies: AuthServiceDependencies) {
@@ -133,7 +107,6 @@ export class AuthService {
     this.config = dependencies.config;
     this.logger = dependencies.logger;
     this.serverKeypair = dependencies.config.serverKeypair;
-    this.now = dependencies.now ?? (() => Date.now());
     this.metrics = dependencies.metrics;
   }
 
@@ -146,8 +119,10 @@ export class AuthService {
 
   async createChallenge(publicKey: string): Promise<ChallengeResponse> {
     try {
-      const sanitizedKey = this.assertValidPublicKey(publicKey);
-      const issuedAt = new Date(this.now());
+      const sanitizedKey = publicKey.trim();
+      this.assertValidPublicKey(sanitizedKey);
+
+      const issuedAt = new Date();
       const expiresAt = new Date(issuedAt.getTime() + this.config.auth.challengeTtlMs);
 
       let nonce: string;
@@ -181,20 +156,9 @@ export class AuthService {
         });
         this.recordChallengeMetric("created", sanitizedKey);
       } catch (error) {
-        this.logger?.error("Failed to persist challenge", {
-          error: error instanceof Error ? error.message : String(error),
-          stellarAddress: sanitizedKey,
-        });
+        this.logger?.error("Failed to persist challenge", { error, stellarAddress: sanitizedKey });
         throw new HttpError(500, "Failed to create challenge.");
       }
-
-      this.logger?.info("auth.challenge_created", {
-        wallet: sanitizedKey,
-        network: this.config.stellar.network,
-        challenge_ttl_ms: this.config.auth.challengeTtlMs,
-        issued_at: issuedAt.toISOString(),
-        expires_at: expiresAt.toISOString(),
-      });
 
       return {
         publicKey: sanitizedKey,
@@ -215,12 +179,17 @@ export class AuthService {
 
   async verifyChallenge(input: VerifyChallengeInput): Promise<VerifyChallengeResponse> {
     try {
-      const sanitizedKey = this.assertValidPublicKey(input.publicKey);
-      const sanitizedNonce = this.assertNonEmptyString(input.nonce, "nonce").trim();
-      const sanitizedSig = this.assertNonEmptyString(input.signature, "signature").trim();
+      const sanitizedKey = input.publicKey.trim();
+      const sanitizedNonce = input.nonce.trim();
+      const sanitizedSig = input.signature.trim();
 
-      if (sanitizedNonce.length < MIN_NONCE_LENGTH) {
+      this.assertValidPublicKey(sanitizedKey);
+
+      if (!sanitizedNonce || sanitizedNonce.length < 16) {
         throw new HttpError(400, "Invalid nonce.");
+      }
+      if (!sanitizedSig) {
+        throw new HttpError(400, "Signature is required.");
       }
 
       let challenge: ChallengeRecord | null;
@@ -230,10 +199,7 @@ export class AuthService {
           hashNonce(sanitizedNonce)
         );
       } catch (error) {
-        this.logger?.error("Failed to fetch challenge", {
-          error: error instanceof Error ? error.message : String(error),
-          stellarAddress: sanitizedKey,
-        });
+        this.logger?.error("Failed to fetch challenge", { error, stellarAddress: sanitizedKey });
         throw new HttpError(500, "Failed to verify challenge.");
       }
 
@@ -257,12 +223,6 @@ export class AuthService {
       const signature = decodeSignature(sanitizedSig);
       const keypair = Keypair.fromPublicKey(sanitizedKey);
 
-      // `decodeSignature` only validates the wire encoding (hex/base64), not
-      // the decoded byte length. The underlying nacl verify throws (rather
-      // than returning false) for a signature that isn't exactly 64 bytes, so
-      // without this try/catch a malformed-but-validly-encoded signature
-      // crashes the request with an unhandled 500 instead of the intended
-      // "Invalid signature." 401.
       let isValid: boolean;
       try {
         isValid = keypair.verify(Buffer.from(challenge.message, "utf8"), signature);
@@ -284,10 +244,7 @@ export class AuthService {
       try {
         consumed = await this.challengeRepository.consume(challenge.id, new Date());
       } catch (error) {
-        this.logger?.error("Failed to consume challenge", {
-          error: error instanceof Error ? error.message : String(error),
-          challengeId: challenge.id,
-        });
+        this.logger?.error("Failed to consume challenge", { error, challengeId: challenge.id });
         throw new HttpError(500, "Failed to verify challenge.");
       }
 
@@ -301,10 +258,7 @@ export class AuthService {
       try {
         user = await this.upsertUser(sanitizedKey);
       } catch (error) {
-        this.logger?.error("Failed to upsert user", {
-          error: error instanceof Error ? error.message : String(error),
-          stellarAddress: sanitizedKey,
-        });
+        this.logger?.error("Failed to upsert user", { error, stellarAddress: sanitizedKey });
         throw new HttpError(500, "Failed to verify challenge.");
       }
 
@@ -328,16 +282,7 @@ export class AuthService {
         user: publicUser,
       };
     } catch (error) {
-      if (error instanceof HttpError) {
-        this.logger?.info("auth.verify_failed", {
-          reason: error.message,
-          // Include only the truncated wallet (never the raw signature or
-          // nonce) so dashboards can correlate failed attempts without
-          // leaking sensitive material.
-          wallet: this.tryTruncateWallet(input?.publicKey),
-        });
-        throw error;
-      }
+      if (error instanceof HttpError) throw error;
       this.logger?.error("Unhandled error in verifyChallenge", {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -376,52 +321,8 @@ export class AuthService {
   }
 
   async getCurrentUser(token: string): Promise<PublicUser> {
-    try {
-      if (typeof token !== "string") {
-        throw new HttpError(
-          401,
-          "Invalid or expired token.",
-          buildAuthFailureDetails(undefined, "missing_token"),
-        );
-      }
-      const sanitizedToken = token.trim();
-      if (!sanitizedToken) {
-        throw new HttpError(
-          401,
-          "Invalid or expired token.",
-          buildAuthFailureDetails(token, "missing_token"),
-        );
-      }
+    let payload: AuthTokenPayload;
 
-      let payload: AuthTokenPayload;
-      try {
-        payload = jwt.verify(sanitizedToken, this.config.jwt.secret) as AuthTokenPayload;
-      } catch (error) {
-        throw new HttpError(
-          401,
-          "Invalid or expired token.",
-          buildAuthFailureDetails(sanitizedToken, classifyJwtError(error)),
-        );
-      }
-
-      if (!payload.sub) {
-        throw new HttpError(
-          401,
-          "Invalid token payload.",
-          buildAuthFailureDetails(sanitizedToken, "invalid_token"),
-        );
-      }
-
-      let user: User | null;
-      try {
-        user = await this.userRepository.findByStellarAddress(payload.sub);
-      } catch (error) {
-        this.logger?.error("Failed to fetch user by stellar address", {
-          error: error instanceof Error ? error.message : String(error),
-          sub: payload.sub,
-        });
-        throw new HttpError(500, "Failed to fetch current user.");
-      }
     const sanitizedToken = token?.trim();
     if (!sanitizedToken) {
       throw new HttpError(
@@ -449,82 +350,39 @@ export class AuthService {
       );
     }
 
-      if (!user) {
-        throw new HttpError(401, "User no longer exists.");
-      }
-
-      return toPublicUser(user);
+    let user: User | null;
+    try {
+      user = await this.userRepository.findByStellarAddress(payload.sub);
     } catch (error) {
-      if (error instanceof HttpError) throw error;
-      this.logger?.error("Unhandled error in getCurrentUser", {
-        error: error instanceof Error ? error.message : String(error),
-      });
+      this.logger?.error("Failed to fetch user by stellar address", { error, sub: payload.sub });
       throw new HttpError(500, "Failed to fetch current user.");
     }
-  }
 
-  private assertNonEmptyString(value: unknown, fieldName: string): string {
-    if (typeof value !== "string") {
-      throw new HttpError(400, `${fieldName} is required.`);
+    if (!user) {
+      throw new HttpError(401, "User no longer exists.");
     }
-    return value;
+
+    return toPublicUser(user);
   }
 
-  private assertValidPublicKey(publicKey: unknown): string {
-    if (typeof publicKey !== "string") {
-      this.logger?.warn("auth.invalid_public_key", {
-        reason: "not_a_string",
-        receivedType: typeof publicKey,
-      });
+  private assertValidPublicKey(publicKey: string): void {
+    if (!StrKey.isValidEd25519PublicKey(publicKey)) {
       throw new HttpError(400, "Invalid Stellar public key.");
     }
-    const sanitized = publicKey.trim();
-    if (!sanitized || !StrKey.isValidEd25519PublicKey(sanitized)) {
-      this.logger?.warn("auth.invalid_public_key", {
-        reason: "malformed_or_invalid_checksum",
-      });
-      throw new HttpError(400, "Invalid Stellar public key.");
-    }
-    return sanitized;
   }
 
-  private tryTruncateWallet(value: unknown): string | null {
-    if (typeof value !== "string" || value.length === 0) return null;
-    if (value.length <= 8) return value;
-    return `${value.slice(0, 4)}...${value.slice(-4)}`;
-  }
-
-  /**
-   * Find-or-create the user for a given Stellar address. Concurrent calls for
-   * the same address are coalesced into a single repository round-trip via
-   * {@link userUpsertInflight}.
-   */
-  private upsertUser(publicKey: string): Promise<User> {
-    const cached = this.userUpsertInflight.get(publicKey);
-    if (cached) return cached;
-
-    const promise = (async () => {
-      const sanitized = publicKey.trim();
   private async upsertUser(publicKey: string): Promise<User> {
     const sanitized = publicKey.trim();
     try {
       const existingUser = await this.userRepository.findByStellarAddress(sanitized);
+
       if (existingUser) {
-        this.logger?.debug("auth.user_found", { wallet: sanitized });
         return existingUser;
       }
-      const created = await this.userRepository.save({ stellarAddress: sanitized });
-      this.logger?.info("auth.user_upserted", {
-        wallet: sanitized,
-        user_id: created.id,
-      });
-      return created;
-    })().finally(() => {
-      this.userUpsertInflight.delete(publicKey);
-    });
 
-    this.userUpsertInflight.set(publicKey, promise);
-    return promise;
+      return await this.userRepository.save({
+        stellarAddress: sanitized,
+      });
     } catch (error) {
       if (error instanceof Error && error.message.includes("duplicate key")) {
         const existing = await this.userRepository.findByStellarAddress(sanitized);
@@ -560,14 +418,14 @@ class TypeOrmUserRepository implements UserRepositoryContract {
   findById(id: string): Promise<User | null> {
     return this.repository.findOne({
       where: { id },
-      select: USER_PROFILE_SELECT,
+      select: USER_PROFILE_SELECT as unknown as FindOptionsSelect<User>,
     });
   }
 
   findByStellarAddress(stellarAddress: string): Promise<User | null> {
     return this.repository.findOne({
       where: { stellarAddress },
-      select: USER_PROFILE_SELECT,
+      select: USER_PROFILE_SELECT as unknown as FindOptionsSelect<User>,
     });
   }
 

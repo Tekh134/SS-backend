@@ -135,10 +135,6 @@ export async function closeDataSource(): Promise<void> {
     );
   } finally {
     initializationPromise = null;
-    logger.error("Failed to initialize DataSource", { error });
-    throw new Error(
-      `DataSource initialization failed: ${error instanceof Error ? error.message : String(error)}`
-    );
   }
 }
 

@@ -275,14 +275,6 @@ export function createUserController(deps: UserControllerDeps) {
             users = fetchedUsers;
             total = fetchedTotal;
           }
-          // Parallelized data and count fetching for high concurrency performance
-          const [fetchedUsers, fetchedCount] = await Promise.all([
-            userRepository.findAll({ skip: (page - 1) * limit, take: limit }),
-            userRepository.count ? userRepository.count() : Promise.resolve(-1),
-          ]);
-
-          users = fetchedUsers;
-          total = fetchedCount >= 0 ? fetchedCount : users.length;
         } catch (error) {
           appLogger.error("Failed to list users", { error, requestId });
           throw new AppError(500, "Failed to list users", "USER_LIST_FAILED");

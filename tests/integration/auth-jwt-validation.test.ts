@@ -196,16 +196,6 @@ describe("JWT authentication validation", () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
-
-    const forgedToken = jwt.sign(
-      {
-        sub: "GFORGED_STELLAR_ADDRESS",
-        stellarAddress: "GFORGED_STELLAR_ADDRESS",
-        userId: crypto.randomUUID(),
-      },
-      "invalid-secret-key",
-      { expiresIn: "15m" }
-    );
   it("rejects GET /api/v1/auth/me when the JWT is signed with an invalid secret key", async () => {
     try {
       const app = createTestApp();
@@ -353,8 +343,18 @@ describe("JWT validation: malformed tokens", () => {
     const invalidPayload = "!!!invalid-base64!!!";
     const badToken = `${header}.${invalidPayload}.signature`;
 
-beforeAll(() => {
-  app = createTestApp();
+    const response = await request(app)
+      .get("/api/v1/auth/me")
+      .set("Authorization", `Bearer ${badToken}`)
+      .expect(401);
+
+    expect(response.body).toMatchObject({
+      success: false,
+      error: {
+        message: "Invalid or expired token.",
+      },
+    });
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -490,7 +490,7 @@ describe("JWT validation: missing or invalid claims", () => {
       expect(response.body).toMatchObject({
         success: false,
         error: {
-          message: "Invalid or expired token.",
+          message: INVALID_PAYLOAD_MESSAGE,
         },
       });
     } catch (error) {
@@ -519,10 +519,11 @@ describe("JWT validation: missing or invalid claims", () => {
     expect(response.body).toMatchObject({
       success: false,
       error: {
-        message: "Invalid or expired token.",
+        message: INVALID_PAYLOAD_MESSAGE,
       },
     });
   });
+});
 
 /** Base claims for a well-formed token; override per case. */
 function claims(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -534,9 +535,26 @@ function claims(overrides: Record<string, unknown> = {}): Record<string, unknown
   };
 }
 
+function signToken(
+  payload: Record<string, unknown>,
+  options?: {
+    secret?: string;
+    algorithm?: string;
+    expiresIn?: string;
+    notBefore?: string;
+  },
+): string {
+  const signOpts: jwt.SignOptions = {
+    expiresIn: (options?.expiresIn ?? "15m") as jwt.SignOptions["expiresIn"],
+  };
+  if (options?.algorithm) signOpts.algorithm = options.algorithm as jwt.Algorithm;
+  if (options?.notBefore) signOpts.notBefore = options.notBefore as jwt.SignOptions["notBefore"];
+  return jwt.sign(payload, options?.secret ?? VALID_JWT_SECRET, signOpts);
+}
+
 /** Issue GET /api/v1/auth/me with the given Authorization header value. */
 function getMe(authorization?: string) {
-  const req = request(app).get("/api/v1/auth/me");
+  const req = request(createTestApp()).get("/api/v1/auth/me");
   return authorization === undefined ? req : req.set("Authorization", authorization);
 }
 
@@ -691,6 +709,7 @@ describe("JWT validation: Authorization header edge cases", () => {
   it("rejects (401) a Bearer value padded with surrounding whitespace", async () => {
     // Implementations differ on whether the padding is trimmed before verify;
     // only the rejection envelope is guaranteed here.
+    const validToken = signToken(claims(), { secret: "wrong-secret" });
     const response = await getMe(`Bearer   ${validToken}   `);
     expectRejected(response);
   });
@@ -815,7 +834,7 @@ describe("JWT validation: token timing edge cases", () => {
     expect(response.body).toMatchObject({
       success: false,
       error: {
-        message: expect.stringContaining("Invalid or expired token."),
+        message: UNKNOWN_USER_MESSAGE,
       },
     });
   });
